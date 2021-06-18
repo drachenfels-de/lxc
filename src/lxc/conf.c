@@ -3645,8 +3645,82 @@ void tmp_proc_unmount(struct lxc_conf *lxc_conf)
 	}
 }
 
+/* is_on_device checks whether the first existing
+ * parent of mnt_dir is on the given mountpoint.
+ */
+static bool is_on_device(const char *mnt_dir, dev_t device) {
+    char buf[PATH_MAX];
+    struct stat sb;
+    char *cur;
+
+    (void)strlcpy(buf, mnt_dir, sizeof(buf));
+    cur = &buf[0];
+
+    /* walk up the path and check the device */
+    for(;;) {
+	if (stat(cur, &sb) == 0)
+	    return sb.st_dev == device;
+
+	if (errno != ENOENT) {
+	    WARN("stat failed for \"%s\": %s", buf, strerror(errno));
+	    return false;
+	}
+	cur = dirname(cur);
+    }
+    return false;
+}
+
+/*
+* TODO add support for fstab mount entries
+*/
+static bool is_used_by_shared_bind_mount(struct lxc_conf *conf, const char *mnt_dir) {
+	/*
+	ret = setup_mount_fstab(&lxc_conf->rootfs, lxc_conf->fstab, name, lxcpath);
+	if (ret < 0)
+		return log_error(-1, "Failed to setup mounts");
+	*/
+
+	struct stat mnt_stat;
+	if (stat(mnt_dir, &mnt_stat) == -1) {
+	    ERROR("failed to stat mountpoint \"%s\": %s", mnt_dir, strerror(errno));
+	    return false;
+	}
+
+	// copied logic from setup_mount_entries
+	if (lxc_list_empty(&conf->mount_list)) {
+	    return false;
+	}
+
+	__do_fclose FILE *file = NULL;
+
+	file = make_anonymous_mount_file(&conf->mount_list, conf->lsm_aa_allow_nesting);
+	if (!file) {
+	    WARN("failed to create mount file");
+	    return false;
+	}
+
+	struct mntent mntent;
+	char buf[PATH_MAX];
+
+	while (getmntent_r(file, &mntent, buf, sizeof(buf))) {
+	    if (!strnequal(mntent.mnt_type, "bind", 4))
+		continue;
+
+	    if (! (hasmntopt(&mntent, "shared") || hasmntopt(&mntent, "rshared")))
+		continue;
+
+	    if (is_on_device(mntent.mnt_fsname, mnt_stat.st_dev))
+		return true;
+	}
+
+	if (!feof(file) || ferror(file))
+	    WARN("failed to parse mount entries");
+
+	return false;
+}
+
 /* Walk /proc/mounts and change any shared entries to dependent mounts. */
-static void turn_into_dependent_mounts(const struct lxc_rootfs *rootfs)
+static void turn_into_dependent_mounts(struct lxc_conf *conf)
 {
 	__do_free char *line = NULL;
 	__do_fclose FILE *f = NULL;
@@ -3655,10 +3729,10 @@ static void turn_into_dependent_mounts(const struct lxc_rootfs *rootfs)
 	ssize_t copied;
 	int ret;
 
-	mntinfo_fd = open_at(rootfs->dfd_host, "proc/self/mountinfo", PROTECT_OPEN,
+	mntinfo_fd = open_at(conf->rootfs.dfd_host, "proc/self/mountinfo", PROTECT_OPEN,
 			     (PROTECT_LOOKUP_BENEATH_XDEV & ~RESOLVE_NO_SYMLINKS), 0);
 	if (mntinfo_fd < 0) {
-		SYSERROR("Failed to open %d/proc/self/mountinfo", rootfs->dfd_host);
+		SYSERROR("Failed to open %d/proc/self/mountinfo", conf->rootfs.dfd_host);
 		return;
 	}
 
@@ -3718,6 +3792,12 @@ static void turn_into_dependent_mounts(const struct lxc_rootfs *rootfs)
 			continue;
 
 		null_endofword(target);
+
+		if (is_used_by_shared_bind_mount(conf, target)) {
+		    WARN("Keeping shared mount (used by mount entry): %s", target);
+		    continue;
+		}
+
 		ret = mount(NULL, target, NULL, MS_SLAVE, NULL);
 		if (ret < 0) {
 			SYSERROR("Failed to recursively turn old root mount tree into dependent mount. Continuing...");
@@ -3791,7 +3871,7 @@ int lxc_setup_rootfs_prepare_root(struct lxc_conf *conf, const char *name,
 	if (conf->rootfs.dfd_host < 0)
 		return log_error_errno(-errno, errno, "Failed to open \"/\"");
 
-	turn_into_dependent_mounts(&conf->rootfs);
+	turn_into_dependent_mounts(conf);
 
 	if (conf->rootfs_setup) {
 		const char *path = conf->rootfs.mount;
