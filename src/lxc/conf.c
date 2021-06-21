@@ -2309,7 +2309,7 @@ skipremount:
 			else
 				return log_error_errno(-1, errno, "Failed to change mount propagation for \"%s\" (optional)", target);
 		}
-		DEBUG("Changed mount propagation for \"%s\"", target);
+		WARN("Changed mount propagation for \"%s\"", target);
 	}
 
 	DEBUG("Mounted \"%s\" on \"%s\" with filesystem type \"%s\"",
@@ -3645,6 +3645,78 @@ void tmp_proc_unmount(struct lxc_conf *lxc_conf)
 	}
 }
 
+static bool skip_shared_mount(struct lxc_conf *conf, const char *mnt_source) {
+	// copied logic from setup_mount_entries
+	if (lxc_list_empty(&conf->mount_list))
+	    return false;
+
+	__do_fclose FILE *file = NULL;
+
+	file = make_anonymous_mount_file(&conf->mount_list, conf->lsm_aa_allow_nesting);
+	if (!file) {
+	    WARN("failed to create mount file");
+	    return false;
+	}
+
+	struct mntent mntent;
+	char buf[PATH_MAX];
+
+	while (getmntent_r(file, &mntent, buf, sizeof(buf))) {
+	    if (strequal(mntent.mnt_fsname, mnt_source))
+		    return true;
+	}
+	return false;
+}
+
+static void bind_mount_shared_mounts(struct lxc_conf *conf) {
+
+	// copied logic from setup_mount_entries
+	if (lxc_list_empty(&conf->mount_list))
+	    return;
+
+	__do_fclose FILE *file = NULL;
+
+	file = make_anonymous_mount_file(&conf->mount_list, conf->lsm_aa_allow_nesting);
+	if (!file) {
+	    WARN("failed to create mount file");
+	    return;
+	}
+
+	struct mntent mntent;
+	char buf[PATH_MAX];
+
+	while (getmntent_r(file, &mntent, buf, sizeof(buf))) {
+		int ret;
+
+		if (! strequal(mntent.mnt_type, "bind"))
+		    continue;
+
+    	    if (hasmntopt(&mntent, "shared")) {
+	    	ret = mount(mntent.mnt_fsname, mntent.mnt_fsname, "none", MS_BIND|MS_REC, NULL);
+	    	if (ret < 0) {
+	    	    WARN("failed to bind mount %s", mntent.mnt_fsname);
+	    	}
+	    	ret = mount(NULL, mntent.mnt_fsname, NULL, MS_SHARED, NULL);
+	    	if (ret < 0) {
+	    	    WARN("failed to remount %s shared", mntent.mnt_fsname);
+	    	}
+	    	WARN("bind mounted %s shared", mntent.mnt_fsname);
+    	    }
+    	    if (hasmntopt(&mntent, "rshared")) {
+	    	ret = mount(mntent.mnt_fsname, mntent.mnt_fsname, "none", MS_BIND|MS_REC, NULL);
+	    	if (ret < 0) {
+	    	    WARN("failed to bind mount %s", mntent.mnt_fsname);
+	    	}
+	    	ret = mount(NULL, mntent.mnt_fsname, NULL, MS_SHARED|MS_REC, NULL);
+	    	if (ret < 0) {
+	    	    WARN("failed to remount %s recursive-shared", mntent.mnt_fsname);
+	    	}
+	    	WARN("bind mounted %s rshared", mntent.mnt_fsname);
+    	    }
+    }
+
+}
+
 /* is_on_device checks whether the first existing
  * parent of mnt_dir is on the given mountpoint.
  */
@@ -3658,8 +3730,11 @@ static bool is_on_device(const char *mnt_dir, dev_t device) {
 
     /* walk up the path and check the device */
     for(;;) {
-	if (stat(cur, &sb) == 0)
+	WARN("foobar: check parent of %s(%ld) on %s", mnt_dir, device, cur);
+	if (stat(cur, &sb) == 0) {
+	    WARN("foobar: matched %s", cur);
 	    return sb.st_dev == device;
+	}
 
 	if (errno != ENOENT) {
 	    WARN("stat failed for \"%s\": %s", buf, strerror(errno));
@@ -3679,6 +3754,9 @@ static bool is_used_by_shared_bind_mount(struct lxc_conf *conf, const char *mnt_
 	if (ret < 0)
 		return log_error(-1, "Failed to setup mounts");
 	*/
+
+	//if (strequal(mnt_dir, "/")
+	//    return false
 
 	struct stat mnt_stat;
 	if (stat(mnt_dir, &mnt_stat) == -1) {
@@ -3708,6 +3786,8 @@ static bool is_used_by_shared_bind_mount(struct lxc_conf *conf, const char *mnt_
 
 	    if (! (hasmntopt(&mntent, "shared") || hasmntopt(&mntent, "rshared")))
 		continue;
+
+	    WARN("foobar check if %s is mounted on %s(%ld)", mntent.mnt_fsname, mnt_dir, mnt_stat.st_dev);
 
 	    if (is_on_device(mntent.mnt_fsname, mnt_stat.st_dev))
 		return true;
@@ -3776,6 +3856,9 @@ static void turn_into_dependent_mounts(struct lxc_conf *conf)
 	 */
 	move_fd(memfd);
 
+	// bind mount shared mounts before making everyhing else private
+	bind_mount_shared_mounts(conf);
+
 	while (getline(&line, &len, f) != -1) {
 		char *opts, *target;
 
@@ -3793,14 +3876,19 @@ static void turn_into_dependent_mounts(struct lxc_conf *conf)
 
 		null_endofword(target);
 
+		/*
 		if (is_used_by_shared_bind_mount(conf, target)) {
 		    WARN("Keeping shared mount (used by mount entry): %s", target);
 		    continue;
 		}
+		*/
+		if (skip_shared_mount(conf, target))
+		  continue;
 
+		WARN("makeing %s a slave mount", target);
 		ret = mount(NULL, target, NULL, MS_SLAVE, NULL);
 		if (ret < 0) {
-			SYSERROR("Failed to recursively turn old root mount tree into dependent mount. Continuing...");
+			SYSERROR("Failed to remount \"%s\" as dependent mount. Continuing...", target);
 			continue;
 		}
 	}
@@ -4316,6 +4404,8 @@ int lxc_setup(struct lxc_handler *handler)
 	ret = lxc_setup_dev_symlinks(&lxc_conf->rootfs);
 	if (ret < 0)
 		return log_error(-1, "Failed to setup \"/dev\" symlinks");
+
+	// pivoting here
 
 	ret = lxc_setup_rootfs_switch_root(&lxc_conf->rootfs);
 	if (ret < 0)
