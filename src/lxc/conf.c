@@ -1551,6 +1551,12 @@ static int lxc_pivot_root(const struct lxc_rootfs *rootfs)
 	__do_close int fd_oldroot = -EBADF;
 	int ret;
 
+               DEBUG("making rootfs target MS_SLAVE");
+               ret = mount(NULL, rootfs->mount, NULL, MS_SLAVE, NULL);
+               if (ret < 0)
+                       return syserror_set(ret, "failed to change rootfs mount propagation");
+
+
 	fd_oldroot = open_at(-EBADF, "/", PROTECT_OPATH_DIRECTORY, PROTECT_LOOKUP_ABSOLUTE, 0);
 	if (fd_oldroot < 0)
 		return log_error_errno(-1, errno, "Failed to open old root directory");
@@ -3797,7 +3803,11 @@ int lxc_setup_rootfs_prepare_root(struct lxc_conf *conf, const char *name,
 	if (conf->rootfs.dfd_host < 0)
 		return log_error_errno(-errno, errno, "Failed to open \"/\"");
 
-	turn_into_dependent_mounts(&conf->rootfs);
+	// make rootfs parent private to prevent mount propagation
+	// FIXME find parent of rootfs->path
+	ret = mount(NULL, "/", NULL, MS_PRIVATE, "");
+	if (ret < 0)
+	    return log_error(-1, "Failed to make / private");
 
 	if (conf->rootfs_setup) {
 		const char *path = conf->rootfs.mount;
